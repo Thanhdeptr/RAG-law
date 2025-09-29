@@ -1,0 +1,9 @@
+{
+  "total_chunks": 1339,
+  "vector_dimension": 768,
+  "total_size_mb": 3.92,
+  "chunk_types": {
+    "clause": 1339
+  },
+  "embedding_model": "nomic-embed-text"
+}
