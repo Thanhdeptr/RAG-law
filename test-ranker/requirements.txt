@@ -1,0 +1,9 @@
+# Requirements for rerank model testing
+torch>=2.0.0
+transformers>=4.30.0
+huggingface_hub>=0.16.0
+numpy>=1.21.0
+safetensors>=0.3.0
+sentence-transformers>=2.2.0
+pyvi>=0.1.1
+
