@@ -1,0 +1,9 @@
+{
+  "total_chunks": 1454,
+  "vector_dimension": 768,
+  "total_size_mb": 4.26,
+  "chunk_types": {
+    "clause": 1454
+  },
+  "embedding_model": "huyydangg/DEk21_hcmute_embedding"
+}
