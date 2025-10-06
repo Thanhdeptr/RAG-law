@@ -53,8 +53,6 @@ def get_rerank_score(query, doc):
     with torch.no_grad():
         outputs = rerank_model(**inputs)
     
-    # Debug: in ra các attributes có sẵn
-    print(f"Model outputs attributes: {[attr for attr in dir(outputs) if not attr.startswith('_')]}")
     
     # Model rerank thường trả về score trực tiếp hoặc qua pooler_output
     if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
