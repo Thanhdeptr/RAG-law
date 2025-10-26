@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from pyvi import ViTokenizer
 from RAGembedding import ContextAwareVectorStore, SearchResult
 
@@ -102,12 +102,67 @@ class AdvancedRetrievalSystem:
                 self.config.rerank_model_id, 
                 trust_remote_code=True
             )
-            self.rerank_model = AutoModel.from_pretrained(
-                self.config.rerank_model_id, 
-                trust_remote_code=True, 
-                device_map="auto"
-            )
-            print("✅ Rerank model loaded")
+            
+            # Try to load with 4-bit quantization for maximum efficiency
+            if torch.cuda.is_available():
+                # Set GPU memory limit to 80% for optimal performance
+                total_gpu_memory = torch.cuda.get_device_properties(0).total_memory
+                max_memory = int(total_gpu_memory * 0.80)
+                print(f"   GPU Memory: {total_gpu_memory / 1024**3:.1f} GB total")
+                print(f"   Setting max memory limit: {max_memory / 1024**3:.1f} GB (80%)")
+                
+                try:
+                    print("   Attempting 4-bit quantization for rerank model...")
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True
+                    )
+                    self.rerank_model = AutoModel.from_pretrained(
+                        self.config.rerank_model_id, 
+                        quantization_config=bnb_config,
+                        device_map="auto",
+                        max_memory={0: max_memory},
+                        trust_remote_code=True
+                    )
+                    print("✅ Rerank model loaded with 4-bit quantization (~75% RAM reduction)")
+                except Exception as quant_error:
+                    print(f"   ⚠️ 4-bit quantization failed: {quant_error}")
+                    print("   Trying 8-bit quantization...")
+                    try:
+                        bnb_config = BitsAndBytesConfig(
+                            load_in_8bit=True
+                        )
+                        self.rerank_model = AutoModel.from_pretrained(
+                            self.config.rerank_model_id, 
+                            quantization_config=bnb_config,
+                            device_map="auto",
+                            max_memory={0: max_memory},
+                            trust_remote_code=True
+                        )
+                        print("✅ Rerank model loaded with 8-bit quantization (~50% RAM reduction)")
+                    except Exception as quant_error2:
+                        print(f"   ⚠️ 8-bit quantization failed: {quant_error2}")
+                        print("   Loading with standard precision...")
+                        self.rerank_model = AutoModel.from_pretrained(
+                            self.config.rerank_model_id,
+                            torch_dtype=torch.float16,
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True,
+                            device_map="auto",
+                            max_memory={0: max_memory}
+                        )
+                        print("✅ Rerank model loaded with float16 (standard)")
+            else:
+                print("   CPU mode - loading without quantization...")
+                self.rerank_model = AutoModel.from_pretrained(
+                    self.config.rerank_model_id,
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True
+                )
+                print("✅ Rerank model loaded with float32 (CPU optimized)")
             
         except Exception as e:
             print(f"❌ Error loading models: {e}")
@@ -466,6 +521,96 @@ class AdvancedRetrievalSystem:
                 result.confidence_score = min(1.0, result.confidence_score + 0.05)
         
         return results
+
+    def _assemble_full_context(self, chunk_result) -> str:
+        """Assemble full context for split chunks by fetching and merging siblings"""
+        
+        metadata = chunk_result.metadata
+        
+        # Check if this is a split chunk
+        if not metadata.get('is_split', False):
+            # Not split, return as-is
+            return chunk_result.content
+        
+        # This is a split chunk - need to reassemble
+        parent_chunk_id = metadata.get('parent_chunk_id')
+        sibling_ids = metadata.get('sibling_chunk_ids', [])
+        current_chunk_id = chunk_result.chunk_id
+        
+        if not parent_chunk_id or not sibling_ids:
+            # Missing info, return as-is
+            return chunk_result.content
+        
+        print(f"      🔗 Assembling split chunk: {current_chunk_id}")
+        print(f"         Parent: {parent_chunk_id}")
+        print(f"         Siblings: {len(sibling_ids)} parts")
+        
+        # Collect all parts (current + siblings)
+        all_parts = []
+        
+        # Add current chunk
+        all_parts.append({
+            'chunk_id': current_chunk_id,
+            'content': chunk_result.content,
+            'split_index': metadata.get('split_index', 0)
+        })
+        
+        # Fetch sibling chunks from vector store
+        for sibling_id in sibling_ids:
+            sibling_result = self.vector_store.get_chunk(sibling_id)
+            if sibling_result:
+                sibling_metadata = sibling_result.metadata
+                all_parts.append({
+                    'chunk_id': sibling_id,
+                    'content': sibling_result.content,
+                    'split_index': sibling_metadata.get('split_index', 0)
+                })
+        
+        # Sort by split_index to maintain correct order
+        all_parts.sort(key=lambda x: x['split_index'])
+        
+        # Merge contents
+        merged_content = ' '.join(part['content'] for part in all_parts)
+        
+        print(f"      ✅ Reassembled {len(all_parts)} parts into full context")
+        
+        return merged_content
+    
+    def _format_context(self, results: List) -> str:
+        """Format retrieved chunks into context with full reassembly for split chunks"""
+        
+        context_parts = []
+        processed_parents = set()  # Track processed parent chunks to avoid duplicates
+        
+        for result in results:
+            article = result.metadata.get('article', 'N/A')
+            title = result.metadata.get('article_title', '')
+            
+            # Check if this is a split chunk
+            if result.metadata.get('is_split', False):
+                parent_chunk_id = result.metadata.get('parent_chunk_id')
+                
+                # Skip if we already processed this parent
+                if parent_chunk_id in processed_parents:
+                    continue
+                
+                # Assemble full content from all parts
+                full_content = self._assemble_full_context(result)
+                processed_parents.add(parent_chunk_id)
+                
+                formatted = f"""=== {article}. {title} ===
+[Đã ghép lại từ {result.metadata.get('total_splits', 1)} phần]
+{full_content}
+---"""
+            else:
+                # Not split, use as-is
+                formatted = f"""=== {article}. {title} ===
+{result.content}
+---"""
+            
+            context_parts.append(formatted)
+        
+        return '\n\n'.join(context_parts)
 
 # ============================================================================
 # UTILITY METHODS
